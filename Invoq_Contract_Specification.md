@@ -1,5 +1,5 @@
 **Invoq**
-
+ 
 Smart Contract Specification
 
 *Production-Ready Soroban Contract Reference*
