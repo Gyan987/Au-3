@@ -1,4 +1,4 @@
-// ─────────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────── 
 // Invoq SDK — Checkout (client-side)
 // Handles the build-tx → wallet-sign → submit-tx flow for subscriptions.
 // Works in browser or any environment with a Stellar wallet adapter.
