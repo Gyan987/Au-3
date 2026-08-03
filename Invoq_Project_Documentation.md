@@ -1,4 +1,4 @@
-**Invoq**
+**Invoq** 
 
 *Programmable Subscription Billing for the Agentic Internet*
 
