@@ -1,4 +1,4 @@
-import { NextResponse, type NextRequest } from "next/server";
+import { NextResponse, type NextRequest } from "next/server"; 
 
 // Lightweight auth gate. The actual /v1/developers/me check happens inside
 // each protected page via getSession() — the proxy here just sends users
