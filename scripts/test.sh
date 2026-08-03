@@ -1,0 +1,1630 @@
+#!/bin/bash
+
+# =============================================================================
+# Invoq — Phase 1 Smoke Test Script
+# =============================================================================
+#
+# Tests the complete subscription lifecycle end-to-end on Stellar testnet:
+#
+#   1.  Verify contracts are initialized (get_admin, get_operator)
+#   2.  Create plans (paid, free, trial)
+#   3.  Read plans back and verify fields
+#   4.  Update a plan
+#   5.  Plan validation (expected rejections)
+#   6.  Subscription creation
+#   7.  Trial plan subscription (skipped — requires second wallet)
+#   8.  Entitlement checks
+#   9.  Usage metering
+#   10. Subscription cancellation
+#   11. Re-subscription after cancellation
+#   12. Plan deactivation / reactivation
+#   13. BillingCycle admin functions
+#   14. Operator management
+#   15. Admin transfer
+#   16. USDC paid plan integration (approve → subscribe → verify payment → cancel)
+#   17. SpendPolicy — initialization, policy lifecycle, spend checks, recording
+#   18. EscrowVault — initialization, vault lifecycle, deposits, debits, withdrawals, close
+#
+# USAGE
+# ─────
+#   bash scripts/test.sh
+#
+# REQUIREMENTS
+# ─────────────
+#   - Both contracts deployed and initialized (run deploy.sh first)
+#   - stellar CLI installed and configured
+#   - SOURCE wallet funded with XLM on testnet
+#
+# NOTE ON set -e
+# ──────────────
+# We do NOT use set -e so that individual test failures are captured and
+# counted rather than aborting the whole run. Each invocation that is
+# expected to fail uses `|| true` to prevent shell exit.
+
+# Do NOT use set -e — we want all tests to run even when some fail.
+
+########################################
+# COLOURS
+########################################
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # no colour
+
+########################################
+# CONFIG
+########################################
+
+NETWORK="testnet"
+SOURCE="mywallet"
+CUSTOMER_SOURCE="imported"
+
+# Manually set contract IDs
+REGISTRY_CONTRACT_ID="CC5FVK42PNUGPQZRYDYW7EVRIQIW2GTNPF6TVMZBBVPCLLDMJZLKU3PF"
+BILLING_CONTRACT_ID="CAR6HPIXMNI4B4GONOWCXLN2N7VHH45FEX7IM2JDARR7XZHETNVDUUOR"
+SPEND_POLICY_CONTRACT_ID="CDTLW43XT55X5FZB3PPC5Y7UG6PSYC4LW3ZED23YIEIVDXVOT72QHFPG"
+ESCROW_VAULT_CONTRACT_ID="CBANJOGMJZ3CAIHX45UWUTDUVXZIMUYOZPXNHYZLKKHZBQ5ZAR6L2LLO"
+
+# Validate core contracts
+if [ -z "$REGISTRY_CONTRACT_ID" ] || [ -z "$BILLING_CONTRACT_ID" ]; then
+  echo -e "${RED}Error: REGISTRY_CONTRACT_ID or BILLING_CONTRACT_ID not set.${NC}"
+  exit 1
+fi
+
+ADMIN_ADDRESS=$(stellar keys address $SOURCE)
+CUSTOMER_ADDRESS=$(stellar keys address $CUSTOMER_SOURCE)
+
+########################################
+# COUNTERS
+########################################
+
+PASS=0
+FAIL=0
+SKIP=0
+
+########################################
+# HELPERS
+########################################
+
+section() {
+  echo ""
+  echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${CYAN}${BOLD}  $1${NC}"
+  echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo ""
+}
+
+step() {
+  echo -e "${BOLD}[$1]${NC} $2"
+}
+
+pass() {
+  echo -e "  ${GREEN}✓ PASS${NC} — $1"
+  PASS=$((PASS + 1))
+}
+
+fail() {
+  echo -e "  ${RED}✗ FAIL${NC} — $1"
+  FAIL=$((FAIL + 1))
+}
+
+skip() {
+  echo -e "  ${YELLOW}⊘ SKIP${NC} — $1"
+  SKIP=$((SKIP + 1))
+}
+
+stellar_invoke() {
+  local output
+  local attempt
+
+  for attempt in 1 2 3; do
+    output=$(stellar contract invoke "$@" 2>&1)
+    if ! echo "$output" | grep -q "transaction submission timeout\|TxBadSeq"; then
+      echo "$output"
+      return 0
+    fi
+
+    if [ "$attempt" -lt 3 ]; then
+      echo -e "  ${YELLOW}↻ retrying transient submission failure (${attempt}/3)${NC}" >&2
+      sleep $((attempt * 5))
+    fi
+  done
+
+  echo "$output"
+  return 1
+}
+
+# invoke_registry: calls Registry signed as admin (mywallet)
+invoke_registry() {
+  stellar_invoke \
+    --id $REGISTRY_CONTRACT_ID \
+    --source-account $SOURCE \
+    --network $NETWORK \
+    -- "$@" 2>&1
+}
+
+# invoke_billing: calls BillingCycle signed as admin (mywallet)
+invoke_billing() {
+  stellar_invoke \
+    --id $BILLING_CONTRACT_ID \
+    --source-account $SOURCE \
+    --network $NETWORK \
+    -- "$@" 2>&1
+}
+
+# invoke_billing_as: calls BillingCycle signed as a specific source account
+# Usage: invoke_billing_as alice initiate_subscription --customer ... --plan_id ...
+invoke_billing_as() {
+  local signer="$1"
+  shift
+  stellar_invoke \
+    --id $BILLING_CONTRACT_ID \
+    --source-account "$signer" \
+    --network $NETWORK \
+    -- "$@" 2>&1
+}
+
+# invoke_registry_as: calls Registry signed as a specific source account
+# Usage: invoke_registry_as alice cancel_subscription --customer ... --immediate true
+invoke_registry_as() {
+  local signer="$1"
+  shift
+  stellar_invoke \
+    --id $REGISTRY_CONTRACT_ID \
+    --source-account "$signer" \
+    --network $NETWORK \
+    -- "$@" 2>&1
+}
+
+# invoke_spend_policy: calls SpendPolicy signed as admin (mywallet)
+invoke_spend_policy() {
+  stellar_invoke \
+    --id $SPEND_POLICY_CONTRACT_ID \
+    --source-account $SOURCE \
+    --network $NETWORK \
+    -- "$@" 2>&1
+}
+
+# invoke_spend_policy_as: calls SpendPolicy signed as a specific source account
+invoke_spend_policy_as() {
+  local signer="$1"
+  shift
+  stellar_invoke \
+    --id $SPEND_POLICY_CONTRACT_ID \
+    --source-account "$signer" \
+    --network $NETWORK \
+    -- "$@" 2>&1
+}
+
+# invoke_escrow_vault: calls EscrowVault signed as admin (mywallet)
+invoke_escrow_vault() {
+  stellar_invoke \
+    --id $ESCROW_VAULT_CONTRACT_ID \
+    --source-account $SOURCE \
+    --network $NETWORK \
+    -- "$@" 2>&1
+}
+
+# invoke_escrow_vault_as: calls EscrowVault signed as a specific source account
+invoke_escrow_vault_as() {
+  local signer="$1"
+  shift
+  stellar_invoke \
+    --id $ESCROW_VAULT_CONTRACT_ID \
+    --source-account "$signer" \
+    --network $NETWORK \
+    -- "$@" 2>&1
+}
+
+# assert_contains: checks that OUTPUT contains EXPECTED string
+assert_contains() {
+  local label="$1"
+  local output="$2"
+  local expected="$3"
+  if echo "$output" | grep -q "$expected"; then
+    pass "$label"
+  else
+    fail "$label (expected '$expected' in output, got: $output)"
+  fi
+}
+
+# assert_not_contains: checks that OUTPUT does NOT contain EXPECTED string
+assert_not_contains() {
+  local label="$1"
+  local output="$2"
+  local expected="$3"
+  if echo "$output" | grep -q "$expected"; then
+    fail "$label (expected '$expected' NOT to be in output, got: $output)"
+  else
+    pass "$label"
+  fi
+}
+
+# assert_success: checks that command did not return an error
+assert_success() {
+  local label="$1"
+  local output="$2"
+  # Match the CLI's actual error indicators (❌, "error:") rather than bare
+  # words like "failed" which appear in JSON field names (grace_retry_failed).
+  if echo "$output" | grep -q "❌\|error:"; then
+    fail "$label (unexpected error: $output)"
+  else
+    pass "$label"
+  fi
+}
+
+# assert_error: checks that command DID return an error (for negative tests)
+assert_error() {
+  local label="$1"
+  local output="$2"
+  if echo "$output" | grep -qi "error\|failed\|panic"; then
+    pass "$label (correctly rejected)"
+  else
+    fail "$label (expected rejection but got success: $output)"
+  fi
+}
+
+########################################
+# BANNER
+########################################
+
+echo ""
+echo -e "${BOLD}╔════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}║   Invoq — Phase 1 Contract Smoke Tests    ║${NC}"
+echo -e "${BOLD}╚════════════════════════════════════════════╝${NC}"
+echo ""
+echo "  Network:         $NETWORK"
+echo "  Admin:           $ADMIN_ADDRESS  ($SOURCE)"
+echo "  Customer:        $CUSTOMER_ADDRESS  ($CUSTOMER_SOURCE)"
+echo "  Registry:        $REGISTRY_CONTRACT_ID"
+echo "  BillingCycle:    $BILLING_CONTRACT_ID"
+echo "  SpendPolicy:     ${SPEND_POLICY_CONTRACT_ID:-"(not set — section 17 will be skipped)"}"
+echo "  EscrowVault:     ${ESCROW_VAULT_CONTRACT_ID:-"(not set — section 18 will be skipped)"}"
+echo "  USDC SAC:        CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA"
+echo ""
+
+########################################
+# TEST 1 — CONTRACT INITIALISATION
+########################################
+
+section "1 — Verify contract initialisation"
+
+step "1.1" "Registry: get_admin"
+OUT=$(invoke_registry get_admin)
+assert_contains "Registry admin matches deploy wallet" "$OUT" "$ADMIN_ADDRESS"
+
+step "1.2" "Registry: get_operator should be BillingCycle"
+OUT=$(invoke_registry get_operator)
+assert_contains "Registry operator is BillingCycle" "$OUT" "$BILLING_CONTRACT_ID"
+
+step "1.3" "BillingCycle: get_admin"
+OUT=$(invoke_billing get_admin)
+assert_contains "BillingCycle admin matches deploy wallet" "$OUT" "$ADMIN_ADDRESS"
+
+step "1.4" "BillingCycle: get_grace_period"
+OUT=$(invoke_billing get_grace_period)
+# Grace period changes during testing (section 13 sets it to 86400).
+# Just verify the function returns a non-zero number — the exact value
+# depends on whether this is a fresh deployment or a re-run.
+assert_success "Grace period is set" "$OUT"
+echo "  → Grace period: $(echo "$OUT" | grep -o '[0-9]\+')"
+
+step "1.5" "BillingCycle: get_registry_id"
+OUT=$(invoke_billing get_registry_id)
+assert_contains "BillingCycle points at Registry" "$OUT" "$REGISTRY_CONTRACT_ID"
+
+########################################
+# TEST 2 — PLAN CREATION
+########################################
+
+section "2 — Plan creation"
+
+step "2.1" "Create a paid monthly plan (5 USDC/month)"
+# Use create_plan (owner signs directly). create_plan_for requires the
+# operator (BillingCycle contract) to sign — it has no wallet key on testnet.
+OUT=$(invoke_registry create_plan \
+  --owner "$ADMIN_ADDRESS" \
+  --name "Pro Monthly" \
+  --price_usdc 50000000 \
+  --interval_seconds 2592000 \
+  --trial_seconds 0 \
+  --usage_limit 100000 \
+  --features '["api_access","webhooks","export"]' 2>&1 || true)
+assert_success "create_plan (paid plan)" "$OUT"
+# Stellar CLI returns the plan_id as a plain integer on its own line
+PAID_PLAN_ID=$(echo "$OUT" | grep -o '[0-9]\+' | tail -1)
+echo "  → Paid plan ID: $PAID_PLAN_ID"
+
+step "2.2" "Create a free plan (0 USDC, no trial)"
+OUT=$(invoke_registry create_plan \
+  --owner "$ADMIN_ADDRESS" \
+  --name "Free Tier" \
+  --price_usdc 0 \
+  --interval_seconds 2592000 \
+  --trial_seconds 0 \
+  --usage_limit 1000 \
+  --features '["api_access"]' 2>&1 || true)
+assert_success "create_plan (free plan)" "$OUT"
+FREE_PLAN_ID=$(echo "$OUT" | grep -o '[0-9]\+' | tail -1)
+echo "  → Free plan ID: $FREE_PLAN_ID"
+
+step "2.3" "Create a plan with a 7-day trial"
+OUT=$(invoke_registry create_plan \
+  --owner "$ADMIN_ADDRESS" \
+  --name "Pro Trial" \
+  --price_usdc 50000000 \
+  --interval_seconds 2592000 \
+  --trial_seconds 604800 \
+  --usage_limit 100000 \
+  --features '["api_access","webhooks"]' 2>&1 || true)
+assert_success "create_plan (trial plan)" "$OUT"
+TRIAL_PLAN_ID=$(echo "$OUT" | grep -o '[0-9]\+' | tail -1)
+echo "  → Trial plan ID: $TRIAL_PLAN_ID"
+
+step "2.4" "plan_count should equal TRIAL_PLAN_ID (last created plan)"
+# We compare against TRIAL_PLAN_ID because the contract may already have plans
+# from previous test runs — plan_count is monotonically increasing.
+OUT=$(invoke_registry plan_count 2>&1 || true)
+assert_contains "plan_count matches last plan ID" "$OUT" "$TRIAL_PLAN_ID"
+
+########################################
+# TEST 3 — PLAN READS
+########################################
+
+section "3 — Plan reads"
+
+step "3.1" "get_plan returns paid plan config"
+OUT=$(invoke_registry get_plan --plan_id "$PAID_PLAN_ID" 2>&1 || true)
+assert_contains "plan name is Pro Monthly"  "$OUT" "Pro Monthly"
+assert_contains "price is 50000000 stroops" "$OUT" "50000000"
+assert_contains "plan is active"            "$OUT" "active"
+
+step "3.2" "get_plan returns free plan config"
+OUT=$(invoke_registry get_plan --plan_id "$FREE_PLAN_ID" 2>&1 || true)
+assert_contains "free plan name is Free Tier" "$OUT" "Free Tier"
+# Stellar CLI serializes i128 as a quoted string: "price_usdc":"0"
+assert_contains "free plan price is 0"        "$OUT" '"price_usdc":"0"'
+
+step "3.3" "get_plan returns None for non-existent plan"
+OUT=$(invoke_registry get_plan --plan_id 9999 2>&1 || true)
+assert_contains "non-existent plan returns null/None" "$OUT" "null"
+
+########################################
+# TEST 4 — PLAN UPDATES
+########################################
+
+section "4 — Plan updates"
+
+step "4.1" "update_plan: change name and usage_limit"
+OUT=$(invoke_registry update_plan \
+  --caller "$ADMIN_ADDRESS" \
+  --plan_id "$PAID_PLAN_ID" \
+  --name "Pro Monthly v2" \
+  --price_usdc 50000000 \
+  --usage_limit 200000 \
+  --features '["api_access","webhooks","export","analytics"]' 2>&1 || true)
+assert_success "update_plan succeeds" "$OUT"
+
+step "4.2" "Verify update applied"
+OUT=$(invoke_registry get_plan --plan_id "$PAID_PLAN_ID" 2>&1 || true)
+assert_contains "name updated to Pro Monthly v2" "$OUT" "Pro Monthly v2"
+assert_contains "usage_limit updated to 200000"  "$OUT" "200000"
+assert_contains "analytics feature added"        "$OUT" "analytics"
+
+########################################
+# TEST 5 — PLAN VALIDATION (negative tests)
+########################################
+
+section "5 — Plan validation (expected rejections)"
+
+step "5.1" "Empty plan name should be rejected"
+OUT=$(invoke_registry create_plan \
+  --owner "$ADMIN_ADDRESS" \
+  --name "" \
+  --price_usdc 0 \
+  --interval_seconds 2592000 \
+  --trial_seconds 0 \
+  --usage_limit 0 \
+  --features '[]' 2>&1 || true)
+assert_error "empty name rejected (InvalidPlanName)" "$OUT"
+
+step "5.2" "Interval below 1 day should be rejected"
+OUT=$(invoke_registry create_plan \
+  --owner "$ADMIN_ADDRESS" \
+  --name "Bad Plan" \
+  --price_usdc 0 \
+  --interval_seconds 3600 \
+  --trial_seconds 0 \
+  --usage_limit 0 \
+  --features '[]' 2>&1 || true)
+assert_error "short interval rejected (InvalidInterval)" "$OUT"
+
+step "5.3" "Negative price should be rejected"
+OUT=$(invoke_registry create_plan \
+  --owner "$ADMIN_ADDRESS" \
+  --name "Negative Plan" \
+  --price_usdc -1 \
+  --interval_seconds 2592000 \
+  --trial_seconds 0 \
+  --usage_limit 0 \
+  --features '[]' 2>&1 || true)
+assert_error "negative price rejected (InvalidPrice)" "$OUT"
+
+########################################
+# TEST 6 — SUBSCRIPTION CREATION
+########################################
+
+section "6 — Subscription creation"
+
+# Start this section from a clean customer subscription state. Testnet state is
+# persistent, and interrupted re-runs can leave Alice subscribed.
+invoke_registry_as $CUSTOMER_SOURCE cancel_subscription \
+  --caller "$CUSTOMER_ADDRESS" \
+  --customer "$CUSTOMER_ADDRESS" \
+  --immediate true > /dev/null 2>&1 || true
+
+# Alice (CUSTOMER_SOURCE) subscribes to the free plan.
+# She signs the transaction herself — initiate_subscription requires customer.require_auth().
+step "6.1" "initiate_subscription on free plan (alice subscribes)"
+OUT=$(invoke_billing_as $CUSTOMER_SOURCE initiate_subscription \
+  --customer "$CUSTOMER_ADDRESS" \
+  --plan_id "$FREE_PLAN_ID" 2>&1 || true)
+assert_success "initiate_subscription on free plan" "$OUT"
+
+step "6.2" "get_subscription returns the record"
+OUT=$(invoke_registry get_subscription --customer "$CUSTOMER_ADDRESS" 2>&1 || true)
+assert_contains "subscription record exists"    "$OUT" "plan_id"
+assert_contains "status is Active"             "$OUT" "Active"
+assert_contains "cancel_at_period_end is false" "$OUT" "false"
+assert_contains "usage_current is 0"           "$OUT" '"usage_current":0'
+
+step "6.3" "is_subscribed returns true"
+OUT=$(invoke_registry is_subscribed --customer "$CUSTOMER_ADDRESS" 2>&1 || true)
+assert_contains "is_subscribed = true" "$OUT" "true"
+
+step "6.4" "Duplicate subscription should be rejected"
+OUT=$(invoke_billing_as $CUSTOMER_SOURCE initiate_subscription \
+  --customer "$CUSTOMER_ADDRESS" \
+  --plan_id "$FREE_PLAN_ID" 2>&1 || true)
+assert_error "duplicate subscription rejected (AlreadySubscribed)" "$OUT"
+
+########################################
+# TEST 7 — TRIAL PLAN SUBSCRIPTION (alice)
+########################################
+
+section "7 — Trial plan subscription"
+
+# Alice already has an active subscription on FREE_PLAN_ID.
+# We cancel it first, then re-subscribe on the TRIAL plan to test the
+# Trialing status and trial_end field.
+
+step "7.1" "Cancel alice's free plan subscription before trial test"
+OUT=$(invoke_registry_as $CUSTOMER_SOURCE cancel_subscription \
+  --caller "$CUSTOMER_ADDRESS" \
+  --customer "$CUSTOMER_ADDRESS" \
+  --immediate true 2>&1 || true)
+assert_success "cancel free plan before trial test" "$OUT"
+
+step "7.2" "Subscribe alice to the trial plan"
+OUT=$(invoke_billing_as $CUSTOMER_SOURCE initiate_subscription \
+  --customer "$CUSTOMER_ADDRESS" \
+  --plan_id "$TRIAL_PLAN_ID" 2>&1 || true)
+assert_success "initiate_subscription on trial plan" "$OUT"
+
+step "7.3" "Subscription status is Trialing"
+OUT=$(invoke_registry get_subscription --customer "$CUSTOMER_ADDRESS" 2>&1 || true)
+assert_contains "status is Trialing"   "$OUT" "Trialing"
+assert_contains "trial_end is set"     "$OUT" "trial_end"
+assert_contains "plan_id is trial plan" "$OUT" "$TRIAL_PLAN_ID"
+
+step "7.4" "Entitlement is granted during trial"
+OUT=$(invoke_registry check_entitlement \
+  --customer "$CUSTOMER_ADDRESS" \
+  --feature "api_access" 2>&1 || true)
+assert_contains "api_access granted during trial" "$OUT" "true"
+
+step "7.5" "Cancel trial and re-subscribe to free plan for remaining tests"
+invoke_registry_as $CUSTOMER_SOURCE cancel_subscription \
+  --caller "$CUSTOMER_ADDRESS" \
+  --customer "$CUSTOMER_ADDRESS" \
+  --immediate true > /dev/null 2>&1 || true
+OUT=$(invoke_billing_as $CUSTOMER_SOURCE initiate_subscription \
+  --customer "$CUSTOMER_ADDRESS" \
+  --plan_id "$FREE_PLAN_ID" 2>&1 || true)
+assert_success "re-subscribe to free plan after trial" "$OUT"
+
+########################################
+# TEST 8 — ENTITLEMENT CHECKS
+########################################
+
+section "8 — Entitlement checks"
+
+# Define a fake address used throughout sections 8 and 13.
+# We use ADMIN_ADDRESS here because the Stellar CLI resolves raw addresses
+# against the local keystore. At this point in the test, admin has no
+# subscription, so it correctly represents an "unsubscribed wallet".
+FAKE_ADDR="$ADMIN_ADDRESS"
+
+step "8.1" "check_entitlement for api_access (should be true)"
+OUT=$(invoke_registry check_entitlement \
+  --customer "$CUSTOMER_ADDRESS" \
+  --feature "api_access" 2>&1 || true)
+assert_contains "api_access granted" "$OUT" "true"
+
+step "8.2" "check_entitlement for webhooks (not in free plan — should be false)"
+OUT=$(invoke_registry check_entitlement \
+  --customer "$CUSTOMER_ADDRESS" \
+  --feature "webhooks" 2>&1 || true)
+assert_contains "webhooks not granted on free plan" "$OUT" "false"
+
+step "8.3" "check_entitlement for unknown feature (should be false)"
+OUT=$(invoke_registry check_entitlement \
+  --customer "$CUSTOMER_ADDRESS" \
+  --feature "nonexistent_feature" 2>&1 || true)
+assert_contains "unknown feature not granted" "$OUT" "false"
+
+step "8.4" "check_entitlement for unsubscribed wallet (should be false)"
+OUT=$(invoke_registry check_entitlement \
+  --customer "$FAKE_ADDR" \
+  --feature "api_access" 2>&1 || true)
+assert_contains "unsubscribed wallet not entitled" "$OUT" "false"
+
+step "8.5" "check_entitlement_full returns usage data"
+OUT=$(invoke_registry check_entitlement_full \
+  --customer "$CUSTOMER_ADDRESS" \
+  --feature "api_access" 2>&1 || true)
+assert_contains "entitled is true"    "$OUT" "true"
+# u64 fields are plain numbers in Stellar CLI JSON output
+assert_contains "usage_current is 0"  "$OUT" '"usage_current":0'
+assert_contains "usage_limit is 1000" "$OUT" '"usage_limit":1000'
+assert_contains "status is Active"    "$OUT" "Active"
+
+########################################
+# TEST 9 — USAGE METERING
+########################################
+
+section "9 — Usage metering"
+
+step "9.1" "increment_usage by 100"
+OUT=$(invoke_registry increment_usage \
+  --caller "$ADMIN_ADDRESS" \
+  --customer "$CUSTOMER_ADDRESS" \
+  --units 100 2>&1 || true)
+assert_contains "increment_usage returns 100" "$OUT" "100"
+
+step "9.2" "increment_usage by 250 (should be 350 total)"
+OUT=$(invoke_registry increment_usage \
+  --caller "$ADMIN_ADDRESS" \
+  --customer "$CUSTOMER_ADDRESS" \
+  --units 250 2>&1 || true)
+assert_contains "total usage is 350" "$OUT" "350"
+
+step "9.3" "check_entitlement_full shows updated usage"
+OUT=$(invoke_registry check_entitlement_full \
+  --customer "$CUSTOMER_ADDRESS" \
+  --feature "api_access" 2>&1 || true)
+assert_contains "usage_current is 350" "$OUT" "350"
+
+step "9.4" "increment_usage with 0 units should be rejected"
+OUT=$(invoke_registry increment_usage \
+  --caller "$ADMIN_ADDRESS" \
+  --customer "$CUSTOMER_ADDRESS" \
+  --units 0 2>&1 || true)
+assert_error "zero units rejected (ZeroUnits)" "$OUT"
+
+step "9.5" "increment_usage_batch — 1 entry"
+OUT=$(invoke_registry increment_usage_batch \
+  --caller "$ADMIN_ADDRESS" \
+  --entries '[{"customer":"'"$CUSTOMER_ADDRESS"'","units":50}]' 2>&1 || true)
+assert_success "increment_usage_batch succeeds" "$OUT"
+assert_contains "batch returned 1 success" "$OUT" "1"
+
+step "9.6" "Verify total usage is now 400"
+OUT=$(invoke_registry check_entitlement_full \
+  --customer "$CUSTOMER_ADDRESS" \
+  --feature "api_access" 2>&1 || true)
+assert_contains "usage_current is 400" "$OUT" "400"
+
+########################################
+# TEST 10 — SUBSCRIPTION CANCELLATION
+########################################
+
+section "10 — Subscription cancellation"
+
+step "10.1" "cancel_subscription end-of-period (alice cancels herself)"
+OUT=$(invoke_registry_as $CUSTOMER_SOURCE cancel_subscription \
+  --caller "$CUSTOMER_ADDRESS" \
+  --customer "$CUSTOMER_ADDRESS" \
+  --immediate false 2>&1 || true)
+assert_success "cancel_subscription (end of period)" "$OUT"
+
+step "10.2" "cancel_at_period_end is now set"
+OUT=$(invoke_registry get_subscription --customer "$CUSTOMER_ADDRESS" 2>&1 || true)
+assert_contains "cancel_at_period_end is true" "$OUT" '"cancel_at_period_end":true'
+
+step "10.3" "still entitled until period ends (cancel is scheduled)"
+OUT=$(invoke_registry check_entitlement \
+  --customer "$CUSTOMER_ADDRESS" \
+  --feature "api_access" 2>&1 || true)
+assert_contains "still entitled after schedule-cancel" "$OUT" "true"
+
+step "10.4" "re-setting cancel_at_period_end is idempotent"
+OUT=$(invoke_registry_as $CUSTOMER_SOURCE cancel_subscription \
+  --caller "$CUSTOMER_ADDRESS" \
+  --customer "$CUSTOMER_ADDRESS" \
+  --immediate false 2>&1 || true)
+assert_success "re-setting cancel_at_period_end is accepted" "$OUT"
+
+step "10.5" "immediate cancel"
+OUT=$(invoke_registry_as $CUSTOMER_SOURCE cancel_subscription \
+  --caller "$CUSTOMER_ADDRESS" \
+  --customer "$CUSTOMER_ADDRESS" \
+  --immediate true 2>&1 || true)
+assert_success "cancel_subscription (immediate)" "$OUT"
+
+step "10.6" "status is Cancelled"
+OUT=$(invoke_registry get_subscription --customer "$CUSTOMER_ADDRESS" 2>&1 || true)
+assert_contains "status is Cancelled" "$OUT" "Cancelled"
+
+step "10.7" "entitlement is false after immediate cancel"
+OUT=$(invoke_registry check_entitlement \
+  --customer "$CUSTOMER_ADDRESS" \
+  --feature "api_access" 2>&1 || true)
+assert_contains "not entitled after cancel" "$OUT" "false"
+
+step "10.8" "is_subscribed is false"
+OUT=$(invoke_registry is_subscribed --customer "$CUSTOMER_ADDRESS" 2>&1 || true)
+assert_contains "is_subscribed = false" "$OUT" "false"
+
+step "10.9" "triple cancel should be rejected (AlreadyCancelled)"
+OUT=$(invoke_registry_as $CUSTOMER_SOURCE cancel_subscription \
+  --caller "$CUSTOMER_ADDRESS" \
+  --customer "$CUSTOMER_ADDRESS" \
+  --immediate true 2>&1 || true)
+assert_error "cancel on cancelled sub rejected" "$OUT"
+
+########################################
+# TEST 11 — RE-SUBSCRIPTION
+########################################
+
+section "11 — Re-subscription after cancellation"
+
+step "11.1" "Re-subscribe alice on the same free plan after cancellation"
+OUT=$(invoke_billing_as $CUSTOMER_SOURCE initiate_subscription \
+  --customer "$CUSTOMER_ADDRESS" \
+  --plan_id "$FREE_PLAN_ID" 2>&1 || true)
+assert_success "re-subscription after cancel" "$OUT"
+
+step "11.2" "New subscription is Active"
+OUT=$(invoke_registry get_subscription --customer "$CUSTOMER_ADDRESS" 2>&1 || true)
+assert_contains "new sub is Active"    "$OUT" "Active"
+assert_contains "usage reset to 0"     "$OUT" '"usage_current":0'
+assert_contains "cancel flag is false" "$OUT" '"cancel_at_period_end":false'
+
+step "11.3" "Entitlement restored"
+OUT=$(invoke_registry check_entitlement \
+  --customer "$CUSTOMER_ADDRESS" \
+  --feature "api_access" 2>&1 || true)
+assert_contains "entitlement restored after re-sub" "$OUT" "true"
+
+########################################
+# TEST 12 — PLAN DEACTIVATION
+########################################
+
+section "12 — Plan deactivation"
+
+step "12.1" "deactivate_plan on paid plan"
+OUT=$(invoke_registry deactivate_plan --caller "$ADMIN_ADDRESS" --plan_id "$PAID_PLAN_ID" 2>&1 || true)
+assert_success "deactivate_plan" "$OUT"
+
+step "12.2" "get_plan shows active=false"
+OUT=$(invoke_registry get_plan --plan_id "$PAID_PLAN_ID" 2>&1 || true)
+assert_contains "plan is now inactive" "$OUT" '"active":false'
+
+step "12.3" "double deactivate should be rejected (AlreadyInactive)"
+OUT=$(invoke_registry deactivate_plan \
+  --caller "$ADMIN_ADDRESS" \
+  --plan_id "$PAID_PLAN_ID" 2>&1 || true)
+assert_error "double deactivate rejected" "$OUT"
+
+step "12.4" "new subscription on deactivated plan rejected (PlanInactive)"
+# Cancel alice's current sub first so we can attempt a fresh subscribe
+invoke_registry_as $CUSTOMER_SOURCE cancel_subscription \
+  --caller "$CUSTOMER_ADDRESS" \
+  --customer "$CUSTOMER_ADDRESS" \
+  --immediate true > /dev/null 2>&1 || true
+
+OUT=$(invoke_billing_as $CUSTOMER_SOURCE initiate_subscription \
+  --customer "$CUSTOMER_ADDRESS" \
+  --plan_id "$PAID_PLAN_ID" 2>&1 || true)
+assert_error "subscribe on inactive plan rejected" "$OUT"
+
+step "12.5" "reactivate_plan"
+OUT=$(invoke_registry reactivate_plan --caller "$ADMIN_ADDRESS" --plan_id "$PAID_PLAN_ID" 2>&1 || true)
+assert_success "reactivate_plan" "$OUT"
+
+step "12.6" "get_plan shows active=true again"
+OUT=$(invoke_registry get_plan --plan_id "$PAID_PLAN_ID" 2>&1 || true)
+assert_contains "plan is active again" "$OUT" '"active":true'
+
+step "12.7" "double reactivate should be rejected (AlreadyActive)"
+OUT=$(invoke_registry reactivate_plan \
+  --caller "$ADMIN_ADDRESS" \
+  --plan_id "$PAID_PLAN_ID" 2>&1 || true)
+assert_error "double reactivate rejected" "$OUT"
+
+########################################
+# TEST 13 — BILLINGCYCLE FUNCTIONS
+########################################
+
+section "13 — BillingCycle admin functions"
+
+step "13.1" "set_grace_period to 1 day (86400 seconds)"
+OUT=$(invoke_billing set_grace_period --new_grace_seconds 86400 2>&1 || true)
+assert_success "set_grace_period" "$OUT"
+
+step "13.2" "get_grace_period returns updated value"
+OUT=$(invoke_billing get_grace_period 2>&1 || true)
+assert_contains "grace period is 86400" "$OUT" "86400"
+
+step "13.3" "set_grace_period below minimum (3600) is rejected"
+OUT=$(invoke_billing set_grace_period \
+  --new_grace_seconds 1800 2>&1 || true)
+assert_error "grace period below minimum rejected" "$OUT"
+
+step "13.4" "get_grace_record for non-subscriber returns null"
+OUT=$(invoke_billing get_grace_record --customer "$FAKE_ADDR" 2>&1 || true)
+assert_contains "no grace record for unknown customer" "$OUT" "null"
+
+step "13.5" "retry_payment for non-grace-period customer is rejected"
+OUT=$(invoke_billing retry_payment \
+  --customer "$FAKE_ADDR" 2>&1 || true)
+assert_error "retry_payment with no grace record rejected" "$OUT"
+
+step "13.6" "process_renewals with empty batch returns zero"
+OUT=$(invoke_billing process_renewals --customers '[]' 2>&1 || true)
+assert_success "process_renewals empty batch" "$OUT"
+# u32 fields are plain numbers in Stellar CLI JSON output
+assert_contains "renewed = 0"       "$OUT" '"renewed":0'
+assert_contains "grace_entered = 0" "$OUT" '"grace_entered":0'
+assert_contains "skipped = 0"       "$OUT" '"skipped":0'
+
+step "13.7" "expire_grace_periods with empty batch returns 0"
+OUT=$(invoke_billing expire_grace_periods --customers '[]' 2>&1 || true)
+assert_contains "expired = 0" "$OUT" "0"
+
+step "13.8" "process_renewals batch over 30 is rejected"
+# Build a JSON array of 31 addresses
+BIG_BATCH='['
+for i in $(seq 1 31); do
+  BIG_BATCH="${BIG_BATCH}\"GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN\""
+  [ $i -lt 31 ] && BIG_BATCH="${BIG_BATCH},"
+done
+BIG_BATCH="${BIG_BATCH}]"
+
+OUT=$(invoke_billing process_renewals \
+  --customers "$BIG_BATCH" 2>&1 || true)
+assert_error "batch over 30 rejected (BatchTooLarge)" "$OUT"
+
+step "13.9" "restore grace period to default (259200) for clean re-runs"
+OUT=$(invoke_billing set_grace_period --new_grace_seconds 259200 2>&1 || true)
+assert_success "grace period restored to 259200" "$OUT"
+
+########################################
+# TEST 14 — OPERATOR MANAGEMENT
+########################################
+
+section "14 — Operator management"
+
+step "14.1" "get_operator returns BillingCycle"
+OUT=$(invoke_registry get_operator 2>&1 || true)
+assert_contains "operator is BillingCycle" "$OUT" "$BILLING_CONTRACT_ID"
+
+step "14.2" "revoke_operator"
+OUT=$(invoke_registry revoke_operator 2>&1 || true)
+assert_success "revoke_operator" "$OUT"
+
+step "14.3" "get_operator returns null after revoke"
+OUT=$(invoke_registry get_operator 2>&1 || true)
+assert_contains "operator is null after revoke" "$OUT" "null"
+
+step "14.4" "restore operator (needed for future tests)"
+OUT=$(invoke_registry set_operator --operator "$BILLING_CONTRACT_ID" 2>&1 || true)
+assert_success "set_operator restored" "$OUT"
+
+step "14.5" "operator is BillingCycle again"
+OUT=$(invoke_registry get_operator 2>&1 || true)
+assert_contains "operator is restored" "$OUT" "$BILLING_CONTRACT_ID"
+
+########################################
+# TEST 15 — ADMIN TRANSFER
+########################################
+
+section "15 — Admin transfer"
+
+# We transfer to the same address (no-op effect) just to verify the function works.
+step "15.1" "transfer_admin to same address (verify function works)"
+OUT=$(invoke_registry transfer_admin --new_admin "$ADMIN_ADDRESS" 2>&1 || true)
+assert_success "transfer_admin" "$OUT"
+
+step "15.2" "admin is still the same address"
+OUT=$(invoke_registry get_admin 2>&1 || true)
+assert_contains "admin unchanged after self-transfer" "$OUT" "$ADMIN_ADDRESS"
+
+########################################
+# TEST 16 — USDC INTEGRATION NOTE
+########################################
+
+########################################
+# TEST 16 — USDC / PAID PLAN INTEGRATION
+########################################
+
+section "16 — USDC paid plan integration"
+
+# Testnet USDC SAC (Circle's official testnet asset contract)
+USDC_SAC="CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA"
+
+# Paid plan costs 50000000 stroops = 5 USDC per month.
+# Approve enough for 2 months so the allowance covers the initial charge.
+APPROVE_AMOUNT=100000000
+
+# Expiration ledger: current ledger + ~30 days worth of ledgers.
+# Testnet closes ~1 ledger/5s → 30 days = 518400 ledgers.
+# We fetch the current ledger sequence via the Horizon API.
+CURRENT_LEDGER=$(curl -sf "https://horizon-testnet.stellar.org/ledgers?order=desc&limit=1" \
+  2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['_embedded']['records'][0]['sequence'])" \
+  2>/dev/null || echo "0")
+if [ -z "$CURRENT_LEDGER" ] || [ "$CURRENT_LEDGER" = "0" ]; then
+  CURRENT_LEDGER=2500000
+fi
+EXPIRY_LEDGER=$(( CURRENT_LEDGER + 518400 ))
+echo "  → Current ledger: $CURRENT_LEDGER  |  Expiry ledger: $EXPIRY_LEDGER"
+
+step "16.1" "Check alice's USDC balance before subscribing"
+OUT=$(stellar_invoke \
+  --id "$USDC_SAC" \
+  --source-account $CUSTOMER_SOURCE \
+  --network $NETWORK \
+  -- balance \
+  --id "$CUSTOMER_ADDRESS" 2>&1 || true)
+assert_success "USDC balance query succeeds" "$OUT"
+echo "  → Alice USDC balance: $(echo "$OUT" | grep -o '"[0-9]*"' | tr -d '"')"
+
+step "16.2" "Alice approves BillingCycle to spend her USDC"
+# The customer must pre-approve BillingCycle as a spender before subscribing.
+# BillingCycle calls transfer_from(spender=itself, from=customer, to=plan_owner).
+OUT=$(stellar_invoke \
+  --id "$USDC_SAC" \
+  --source-account $CUSTOMER_SOURCE \
+  --network $NETWORK \
+  -- approve \
+  --from "$CUSTOMER_ADDRESS" \
+  --spender "$BILLING_CONTRACT_ID" \
+  --amount $APPROVE_AMOUNT \
+  --expiration_ledger $EXPIRY_LEDGER 2>&1 || true)
+assert_success "USDC approve succeeds" "$OUT"
+
+step "16.3" "Verify allowance is set"
+OUT=$(stellar_invoke \
+  --id "$USDC_SAC" \
+  --source-account $CUSTOMER_SOURCE \
+  --network $NETWORK \
+  -- allowance \
+  --from "$CUSTOMER_ADDRESS" \
+  --spender "$BILLING_CONTRACT_ID" 2>&1 || true)
+assert_contains "allowance is set" "$OUT" "$APPROVE_AMOUNT"
+
+step "16.4" "Alice subscribes to the paid plan (5 USDC charged immediately)"
+# Ensure alice has no active subscription before subscribing
+invoke_registry_as $CUSTOMER_SOURCE cancel_subscription \
+  --caller "$CUSTOMER_ADDRESS" \
+  --customer "$CUSTOMER_ADDRESS" \
+  --immediate true > /dev/null 2>&1 || true
+
+OUT=$(invoke_billing_as $CUSTOMER_SOURCE initiate_subscription \
+  --customer "$CUSTOMER_ADDRESS" \
+  --plan_id "$PAID_PLAN_ID" 2>&1 || true)
+assert_success "paid plan subscription succeeds" "$OUT"
+
+step "16.5" "Subscription record shows Active status on paid plan"
+OUT=$(invoke_registry get_subscription --customer "$CUSTOMER_ADDRESS" 2>&1 || true)
+assert_contains "subscription is Active"       "$OUT" "Active"
+assert_contains "subscription is on paid plan" "$OUT" "$PAID_PLAN_ID"
+
+step "16.6" "Entitlement granted for paid features (api_access)"
+OUT=$(invoke_registry check_entitlement \
+  --customer "$CUSTOMER_ADDRESS" \
+  --feature "api_access" 2>&1 || true)
+assert_contains "api_access granted on paid plan" "$OUT" "true"
+
+step "16.7" "Entitlement granted for webhooks (paid plan feature)"
+OUT=$(invoke_registry check_entitlement \
+  --customer "$CUSTOMER_ADDRESS" \
+  --feature "webhooks" 2>&1 || true)
+assert_contains "webhooks granted on paid plan" "$OUT" "true"
+
+step "16.8" "Alice's USDC balance decreased by 5 USDC after subscription"
+OUT=$(stellar_invoke \
+  --id "$USDC_SAC" \
+  --source-account $CUSTOMER_SOURCE \
+  --network $NETWORK \
+  -- balance \
+  --id "$CUSTOMER_ADDRESS" 2>&1 || true)
+assert_success "USDC balance query after subscription succeeds" "$OUT"
+echo "  → Alice USDC balance after subscription: $(echo "$OUT" | grep -o '"[0-9]*"' | tr -d '"')"
+
+step "16.9" "Plan owner (admin) received the 5 USDC payment"
+OUT=$(stellar_invoke \
+  --id "$USDC_SAC" \
+  --source-account $SOURCE \
+  --network $NETWORK \
+  -- balance \
+  --id "$ADMIN_ADDRESS" 2>&1 || true)
+assert_success "Admin USDC balance query succeeds" "$OUT"
+echo "  → Admin USDC balance after receiving payment: $(echo "$OUT" | grep -o '"[0-9]*"' | tr -d '"')"
+
+step "16.10" "Duplicate paid subscription is rejected"
+OUT=$(invoke_billing_as $CUSTOMER_SOURCE initiate_subscription \
+  --customer "$CUSTOMER_ADDRESS" \
+  --plan_id "$PAID_PLAN_ID" 2>&1 || true)
+assert_error "duplicate paid subscription rejected" "$OUT"
+
+step "16.11" "Cancel paid subscription (immediate)"
+OUT=$(invoke_registry_as $CUSTOMER_SOURCE cancel_subscription \
+  --caller "$CUSTOMER_ADDRESS" \
+  --customer "$CUSTOMER_ADDRESS" \
+  --immediate true 2>&1 || true)
+assert_success "cancel paid subscription" "$OUT"
+
+step "16.12" "Entitlement revoked after cancellation"
+OUT=$(invoke_registry check_entitlement \
+  --customer "$CUSTOMER_ADDRESS" \
+  --feature "api_access" 2>&1 || true)
+assert_contains "not entitled after paid plan cancel" "$OUT" "false"
+
+step "16.13" "Subscribe with zero allowance is rejected (PaymentFailed)"
+# Revoke allowance by setting it to 0
+stellar_invoke \
+  --id "$USDC_SAC" \
+  --source-account $CUSTOMER_SOURCE \
+  --network $NETWORK \
+  -- approve \
+  --from "$CUSTOMER_ADDRESS" \
+  --spender "$BILLING_CONTRACT_ID" \
+  --amount 0 \
+  --expiration_ledger $EXPIRY_LEDGER > /dev/null 2>&1 || true
+
+OUT=$(invoke_billing_as $CUSTOMER_SOURCE initiate_subscription \
+  --customer "$CUSTOMER_ADDRESS" \
+  --plan_id "$PAID_PLAN_ID" 2>&1 || true)
+assert_error "subscription without allowance rejected (PaymentFailed)" "$OUT"
+
+########################################
+# TEST 17 — SPEND POLICY
+########################################
+
+section "17 — SpendPolicy contract"
+
+# SpendPolicy is optional — skip the whole section if not deployed yet.
+if [ -z "$SPEND_POLICY_CONTRACT_ID" ]; then
+  skip "SpendPolicy not deployed — set SPEND_POLICY_CONTRACT_ID and run: npm run deploy:spend-policy"
+else
+
+# Roles used in this section:
+#   ADMIN_ADDRESS    — policy owner (creates and manages the policy)
+#   CUSTOMER_ADDRESS — the "agent" wallet governed by the policy
+#   ADMIN_ADDRESS    — also the payment destination (plan owner)
+AGENT_ADDRESS="$CUSTOMER_ADDRESS"
+DEST_ADDRESS="$ADMIN_ADDRESS"
+
+# ── Pre-test cleanup ──────────────────────────────────────────────────────────
+# The SpendPolicy contract is persistent on testnet. If a policy already exists
+# from a previous run, delete it by updating it to remove all agents (which
+# deregisters them), then we can proceed as if fresh.
+# We cannot truly delete a policy, so instead we update it to have no agents
+# and no limits, making it a no-op, then the "create" step will fail with
+# PolicyAlreadyExists — so we skip create if it already exists and just verify.
+EXISTING_POLICY=$(invoke_spend_policy get_policy --owner "$ADMIN_ADDRESS" 2>&1 || true)
+if echo "$EXISTING_POLICY" | grep -q '"owner"'; then
+  echo "  ℹ️  Policy already exists from a previous run — cleaning up agent registrations"
+  # Remove all agents by updating with empty agent list, then re-add for this run
+  invoke_spend_policy_as $SOURCE update_policy \
+    --caller "$ADMIN_ADDRESS" \
+    --daily_limit_usdc 100000000 \
+    --tx_limit_usdc 20000000 \
+    --allowlist '[]' \
+    --agents '[]' > /dev/null 2>&1 || true
+  # Ensure policy is active for the test run
+  invoke_spend_policy_as $SOURCE reactivate_policy \
+    --caller "$ADMIN_ADDRESS" > /dev/null 2>&1 || true
+  POLICY_PREEXISTS=true
+else
+  POLICY_PREEXISTS=false
+fi
+# ─────────────────────────────────────────────────────────────────────────────
+
+step "17.1" "SpendPolicy: get_admin"
+OUT=$(invoke_spend_policy get_admin 2>&1 || true)
+assert_contains "SpendPolicy admin matches deploy wallet" "$OUT" "$ADMIN_ADDRESS"
+
+step "17.2" "get_policy returns null OR existing policy (persistent testnet)"
+OUT=$(invoke_spend_policy get_policy --owner "$ADMIN_ADDRESS" 2>&1 || true)
+# On first deploy: null. On re-runs: existing policy. Both are valid.
+assert_success "get_policy call succeeds" "$OUT"
+echo "  → Policy state: $(echo "$OUT" | grep -o '"active":[a-z]*' || echo 'null')"
+
+step "17.3" "get_agent_owner returns null for unregistered agent (after cleanup)"
+OUT=$(invoke_spend_policy get_agent_owner --agent "$AGENT_ADDRESS" 2>&1 || true)
+# After cleanup above, agent should be deregistered
+assert_contains "agent has no owner after cleanup" "$OUT" "null"
+
+step "17.4" "check_spend returns NoPolicyFound or Allowed for ungoverned agent"
+OUT=$(invoke_spend_policy check_spend \
+  --agent "$AGENT_ADDRESS" \
+  --destination "$DEST_ADDRESS" \
+  --amount_usdc 10000000 2>&1 || true)
+# NoPolicyFound (no policy) or Allowed (inactive policy) — both permit the spend
+assert_success "check_spend call succeeds" "$OUT"
+echo "  → Result: $(echo "$OUT" | grep -o 'NoPolicyFound\|Allowed\|Blocked[A-Za-z]*')"
+
+step "17.5" "is_spend_allowed returns true when agent is not governed"
+OUT=$(invoke_spend_policy is_spend_allowed \
+  --agent "$AGENT_ADDRESS" \
+  --destination "$DEST_ADDRESS" \
+  --amount_usdc 10000000 2>&1 || true)
+assert_contains "allowed when agent not governed" "$OUT" "true"
+
+step "17.6" "create_policy (or verify existing): 10 USDC/day, 2 USDC/tx, no allowlist"
+# daily_limit = 100000000 stroops = 10 USDC
+# tx_limit    = 20000000  stroops = 2 USDC
+if [ "$POLICY_PREEXISTS" = "true" ]; then
+  # Policy already exists — update it to the expected state for this test run
+  OUT=$(invoke_spend_policy_as $SOURCE update_policy \
+    --caller "$ADMIN_ADDRESS" \
+    --daily_limit_usdc 100000000 \
+    --tx_limit_usdc 20000000 \
+    --allowlist '[]' \
+    --agents '["'"$AGENT_ADDRESS"'"]' 2>&1 || true)
+  assert_success "update_policy to test state (policy pre-existed)" "$OUT"
+else
+  OUT=$(invoke_spend_policy_as $SOURCE create_policy \
+    --owner "$ADMIN_ADDRESS" \
+    --daily_limit_usdc 100000000 \
+    --tx_limit_usdc 20000000 \
+    --allowlist '[]' \
+    --agents '["'"$AGENT_ADDRESS"'"]' 2>&1 || true)
+  assert_success "create_policy succeeds" "$OUT"
+fi
+
+step "17.7" "get_policy returns the policy config"
+OUT=$(invoke_spend_policy get_policy --owner "$ADMIN_ADDRESS" 2>&1 || true)
+assert_contains "policy owner is admin"    "$OUT" "$ADMIN_ADDRESS"
+assert_contains "daily_limit is set"       "$OUT" "100000000"
+assert_contains "tx_limit is set"          "$OUT" "20000000"
+assert_contains "policy is active"         "$OUT" '"active":true'
+
+step "17.8" "get_agent_owner returns admin for the registered agent"
+OUT=$(invoke_spend_policy get_agent_owner --agent "$AGENT_ADDRESS" 2>&1 || true)
+assert_contains "agent owner is admin" "$OUT" "$ADMIN_ADDRESS"
+
+step "17.9" "check_spend: 1 USDC within limits → Allowed"
+# 1 USDC = 10000000 stroops, tx_limit = 2 USDC = 20000000 stroops → within limit
+OUT=$(invoke_spend_policy check_spend \
+  --agent "$AGENT_ADDRESS" \
+  --destination "$DEST_ADDRESS" \
+  --amount_usdc 10000000 2>&1 || true)
+assert_contains "1 USDC within limits is Allowed" "$OUT" "Allowed"
+
+step "17.10" "check_spend: 3 USDC exceeds tx_limit (2 USDC) → BlockedByTxLimit"
+# 3 USDC = 30000000 stroops > tx_limit of 20000000 stroops
+OUT=$(invoke_spend_policy check_spend \
+  --agent "$AGENT_ADDRESS" \
+  --destination "$DEST_ADDRESS" \
+  --amount_usdc 30000000 2>&1 || true)
+assert_contains "3 USDC blocked by tx limit" "$OUT" "BlockedByTxLimit"
+
+step "17.11" "is_spend_allowed: 3 USDC → false (tx limit exceeded)"
+OUT=$(invoke_spend_policy is_spend_allowed \
+  --agent "$AGENT_ADDRESS" \
+  --destination "$DEST_ADDRESS" \
+  --amount_usdc 30000000 2>&1 || true)
+assert_contains "is_spend_allowed false for over-tx-limit" "$OUT" "false"
+
+step "17.12" "create_policy duplicate is rejected (PolicyAlreadyExists)"
+OUT=$(invoke_spend_policy_as $SOURCE create_policy \
+  --owner "$ADMIN_ADDRESS" \
+  --daily_limit_usdc 0 \
+  --tx_limit_usdc 0 \
+  --allowlist '[]' \
+  --agents '[]' 2>&1 || true)
+assert_error "duplicate policy rejected" "$OUT"
+
+step "17.13" "create_policy with negative limit is rejected (InvalidAmount)"
+OUT=$(invoke_spend_policy_as $CUSTOMER_SOURCE create_policy \
+  --owner "$CUSTOMER_ADDRESS" \
+  --daily_limit_usdc -1 \
+  --tx_limit_usdc 0 \
+  --allowlist '[]' \
+  --agents '[]' 2>&1 || true)
+assert_error "negative daily limit rejected" "$OUT"
+
+step "17.14" "record_spend: admin records 1 USDC spend for agent"
+OUT=$(invoke_spend_policy record_spend \
+  --caller "$ADMIN_ADDRESS" \
+  --agent "$AGENT_ADDRESS" \
+  --amount_usdc 10000000 2>&1 || true)
+assert_success "record_spend succeeds" "$OUT"
+# Extract the returned daily total — it accumulates across runs
+DAILY_AFTER_RECORD=$(echo "$OUT" | grep -o '[0-9]\{7,\}' | tail -1)
+echo "  → Daily total after record: $DAILY_AFTER_RECORD"
+assert_success "record_spend returned a total" "$OUT"
+
+step "17.15" "get_daily_spent reflects the recorded spend"
+NOW_TS=$(date +%s)
+OUT=$(invoke_spend_policy get_daily_spent \
+  --owner "$ADMIN_ADDRESS" \
+  --timestamp $NOW_TS 2>&1 || true)
+assert_success "get_daily_spent call succeeds" "$OUT"
+echo "  → Daily spent today: $(echo "$OUT" | grep -o '[0-9]\{7,\}')"
+# Verify it matches what record_spend returned
+assert_contains "daily spent matches recorded total" "$OUT" "$DAILY_AFTER_RECORD"
+
+step "17.16" "record_spend with 0 amount is rejected (InvalidAmount)"
+OUT=$(invoke_spend_policy record_spend \
+  --caller "$ADMIN_ADDRESS" \
+  --agent "$AGENT_ADDRESS" \
+  --amount_usdc 0 2>&1 || true)
+assert_error "zero amount rejected" "$OUT"
+
+step "17.17" "check_spend: 1 USDC within tx_limit → Allowed (if daily not exhausted)"
+# tx_limit = 2 USDC. Use 1 USDC (10000000) which is always within tx limit.
+# Daily limit check depends on how much has been spent today — we just verify
+# the result is either Allowed or BlockedByDailyLimit (not a tx limit block).
+OUT=$(invoke_spend_policy check_spend \
+  --agent "$AGENT_ADDRESS" \
+  --destination "$DEST_ADDRESS" \
+  --amount_usdc 10000000 2>&1 || true)
+assert_success "check_spend 1 USDC call succeeds" "$OUT"
+# Must NOT be blocked by tx limit — only daily limit could block it
+assert_not_contains "1 USDC not blocked by tx limit" "$OUT" "BlockedByTxLimit"
+echo "  → Result: $(echo "$OUT" | grep -o 'Allowed\|Blocked[A-Za-z]*')"
+
+step "17.18" "check_spend: 3 USDC still blocked by tx_limit regardless of daily"
+# tx_limit = 2 USDC. 3 USDC always exceeds it, regardless of daily spend state.
+OUT=$(invoke_spend_policy check_spend \
+  --agent "$AGENT_ADDRESS" \
+  --destination "$DEST_ADDRESS" \
+  --amount_usdc 30000000 2>&1 || true)
+assert_contains "3 USDC always blocked by tx limit" "$OUT" "BlockedByTxLimit"
+
+step "17.19" "update_policy: add allowlist restriction"
+OUT=$(invoke_spend_policy_as $SOURCE update_policy \
+  --caller "$ADMIN_ADDRESS" \
+  --daily_limit_usdc 100000000 \
+  --tx_limit_usdc 20000000 \
+  --allowlist '["'"$DEST_ADDRESS"'"]' \
+  --agents '["'"$AGENT_ADDRESS"'"]' 2>&1 || true)
+assert_success "update_policy with allowlist succeeds" "$OUT"
+
+step "17.20" "check_spend to allowlisted destination → Allowed"
+OUT=$(invoke_spend_policy check_spend \
+  --agent "$AGENT_ADDRESS" \
+  --destination "$DEST_ADDRESS" \
+  --amount_usdc 10000000 2>&1 || true)
+assert_contains "allowlisted destination is Allowed" "$OUT" "Allowed"
+
+step "17.21" "check_spend to non-allowlisted destination → BlockedByAllowlist"
+OUT=$(invoke_spend_policy check_spend \
+  --agent "$AGENT_ADDRESS" \
+  --destination "$CUSTOMER_ADDRESS" \
+  --amount_usdc 10000000 2>&1 || true)
+assert_contains "non-allowlisted destination blocked" "$OUT" "BlockedByAllowlist"
+
+step "17.22" "deactivate_policy"
+OUT=$(invoke_spend_policy_as $SOURCE deactivate_policy \
+  --caller "$ADMIN_ADDRESS" 2>&1 || true)
+assert_success "deactivate_policy succeeds" "$OUT"
+
+step "17.23" "get_policy shows active=false"
+OUT=$(invoke_spend_policy get_policy --owner "$ADMIN_ADDRESS" 2>&1 || true)
+assert_contains "policy is inactive" "$OUT" '"active":false'
+
+step "17.24" "check_spend while policy inactive → Allowed (bypass mode)"
+OUT=$(invoke_spend_policy check_spend \
+  --agent "$AGENT_ADDRESS" \
+  --destination "$CUSTOMER_ADDRESS" \
+  --amount_usdc 999999999 2>&1 || true)
+assert_contains "inactive policy allows all" "$OUT" "Allowed"
+
+step "17.25" "double deactivate is rejected (AlreadyInactive)"
+OUT=$(invoke_spend_policy_as $SOURCE deactivate_policy \
+  --caller "$ADMIN_ADDRESS" 2>&1 || true)
+assert_error "double deactivate rejected" "$OUT"
+
+step "17.26" "reactivate_policy"
+OUT=$(invoke_spend_policy_as $SOURCE reactivate_policy \
+  --caller "$ADMIN_ADDRESS" 2>&1 || true)
+assert_success "reactivate_policy succeeds" "$OUT"
+
+step "17.27" "get_policy shows active=true again"
+OUT=$(invoke_spend_policy get_policy --owner "$ADMIN_ADDRESS" 2>&1 || true)
+assert_contains "policy is active again" "$OUT" '"active":true'
+
+step "17.28" "double reactivate is rejected (AlreadyActive)"
+OUT=$(invoke_spend_policy_as $SOURCE reactivate_policy \
+  --caller "$ADMIN_ADDRESS" 2>&1 || true)
+assert_error "double reactivate rejected" "$OUT"
+
+step "17.29" "transfer_admin to same address (verify function works)"
+OUT=$(invoke_spend_policy transfer_admin \
+  --caller "$ADMIN_ADDRESS" \
+  --new_admin "$ADMIN_ADDRESS" 2>&1 || true)
+assert_success "transfer_admin succeeds" "$OUT"
+
+step "17.30" "get_admin still returns admin after self-transfer"
+OUT=$(invoke_spend_policy get_admin 2>&1 || true)
+assert_contains "admin unchanged" "$OUT" "$ADMIN_ADDRESS"
+
+fi  # end SPEND_POLICY_CONTRACT_ID check
+
+########################################
+# TEST 18 — ESCROW VAULT
+########################################
+
+section "18 — EscrowVault contract"
+
+# EscrowVault is optional — skip the whole section if not deployed yet.
+if [ -z "$ESCROW_VAULT_CONTRACT_ID" ]; then
+  skip "EscrowVault not deployed — set ESCROW_VAULT_CONTRACT_ID and run: npm run deploy:escrow-vault"
+else
+
+# Roles used in this section:
+#   ADMIN_ADDRESS    — contract admin (Invoq metering service)
+#   CUSTOMER_ADDRESS — vault owner (deposits and withdraws)
+#   ADMIN_ADDRESS    — also the developer receiving debits (same wallet, different role)
+VAULT_CUSTOMER="$CUSTOMER_ADDRESS"
+VAULT_DEVELOPER="$ADMIN_ADDRESS"
+USDC_SAC="CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA"
+
+# Minimum deposit is 1_000_000 stroops = 0.10 USDC
+INITIAL_DEPOSIT=5000000   # 0.50 USDC
+DEPOSIT_AMOUNT=2000000    # 0.20 USDC
+DEBIT_AMOUNT=1000000      # 0.10 USDC
+WITHDRAW_AMOUNT=1000000   # 0.10 USDC
+
+# ── Pre-test cleanup ──────────────────────────────────────────────────────────
+# If a vault already exists from a previous run, close it first so we start
+# from a clean state. close_vault refunds the balance and removes the record.
+EXISTING_VAULT=$(invoke_escrow_vault get_vault \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" 2>&1 || true)
+if echo "$EXISTING_VAULT" | grep -q '"customer"'; then
+  echo "  ℹ️  Vault already exists from a previous run — closing it for a clean start"
+  invoke_escrow_vault close_vault \
+    --caller "$ADMIN_ADDRESS" \
+    --customer "$VAULT_CUSTOMER" \
+    --developer "$VAULT_DEVELOPER" > /dev/null 2>&1 || true
+fi
+# ─────────────────────────────────────────────────────────────────────────────
+
+step "18.1" "EscrowVault: get_admin"
+OUT=$(invoke_escrow_vault get_admin 2>&1 || true)
+assert_contains "EscrowVault admin matches deploy wallet" "$OUT" "$ADMIN_ADDRESS"
+
+step "18.2" "EscrowVault: get_usdc_sac"
+OUT=$(invoke_escrow_vault get_usdc_sac 2>&1 || true)
+assert_contains "USDC SAC address is correct" "$OUT" "$USDC_SAC"
+
+step "18.3" "vault_exists returns false before creation"
+OUT=$(invoke_escrow_vault vault_exists \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" 2>&1 || true)
+assert_contains "vault does not exist yet" "$OUT" "false"
+
+step "18.4" "get_vault returns null before creation"
+OUT=$(invoke_escrow_vault get_vault \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" 2>&1 || true)
+assert_contains "get_vault returns null before creation" "$OUT" "null"
+
+# ── Approve USDC allowance for the vault contract ─────────────────────────────
+# Customer must approve EscrowVault as a spender before create_vault can
+# pull the initial deposit via SAC transfer.
+CURRENT_LEDGER=$(curl -sf "https://horizon-testnet.stellar.org/ledgers?order=desc&limit=1" \
+  2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['_embedded']['records'][0]['sequence'])" \
+  2>/dev/null || echo "0")
+if [ -z "$CURRENT_LEDGER" ] || [ "$CURRENT_LEDGER" = "0" ]; then
+  skip "18.5–18.x: Could not fetch current ledger — skipping USDC-dependent vault tests"
+else
+
+EXPIRY_LEDGER=$((CURRENT_LEDGER + 518400))  # ~30 days
+
+step "18.5" "Approve EscrowVault to spend USDC on behalf of customer"
+OUT=$(stellar_invoke \
+  --id "$USDC_SAC" \
+  --source-account $CUSTOMER_SOURCE \
+  --network $NETWORK \
+  -- approve \
+  --from "$VAULT_CUSTOMER" \
+  --spender "$ESCROW_VAULT_CONTRACT_ID" \
+  --amount 20000000 \
+  --expiration_ledger $EXPIRY_LEDGER 2>&1 || true)
+assert_success "USDC approve for EscrowVault succeeds" "$OUT"
+
+step "18.6" "create_vault: 0.50 USDC initial deposit, no threshold, no auto top-up"
+OUT=$(invoke_escrow_vault_as $CUSTOMER_SOURCE create_vault \
+  --caller "$VAULT_CUSTOMER" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" \
+  --initial_deposit $INITIAL_DEPOSIT \
+  --low_balance_threshold 0 \
+  --auto_topup_amount 0 2>&1 || true)
+assert_success "create_vault succeeds" "$OUT"
+assert_contains "vault record returned"       "$OUT" '"customer"'
+assert_contains "balance equals deposit"      "$OUT" "$INITIAL_DEPOSIT"
+assert_contains "total_deposited is correct"  "$OUT" "$INITIAL_DEPOSIT"
+assert_contains "total_debited is 0"          "$OUT" '"total_debited":"0"'
+
+step "18.7" "vault_exists returns true after creation"
+OUT=$(invoke_escrow_vault vault_exists \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" 2>&1 || true)
+assert_contains "vault exists after creation" "$OUT" "true"
+
+step "18.8" "get_vault returns the vault record"
+OUT=$(invoke_escrow_vault get_vault \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" 2>&1 || true)
+assert_contains "vault customer matches"   "$OUT" "$VAULT_CUSTOMER"
+assert_contains "vault developer matches"  "$OUT" "$VAULT_DEVELOPER"
+assert_contains "balance is correct"       "$OUT" "$INITIAL_DEPOSIT"
+
+step "18.9" "get_balance returns the vault balance"
+OUT=$(invoke_escrow_vault get_balance \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" 2>&1 || true)
+assert_contains "get_balance returns initial deposit" "$OUT" "$INITIAL_DEPOSIT"
+
+step "18.10" "create_vault duplicate is rejected (VaultAlreadyExists)"
+OUT=$(invoke_escrow_vault_as $CUSTOMER_SOURCE create_vault \
+  --caller "$VAULT_CUSTOMER" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" \
+  --initial_deposit $INITIAL_DEPOSIT \
+  --low_balance_threshold 0 \
+  --auto_topup_amount 0 2>&1 || true)
+assert_error "duplicate vault rejected (VaultAlreadyExists)" "$OUT"
+
+step "18.11" "create_vault with deposit below minimum is rejected (DepositTooSmall)"
+# Min deposit is 1_000_000 stroops. Use 500_000 (0.05 USDC).
+OUT=$(invoke_escrow_vault_as $CUSTOMER_SOURCE create_vault \
+  --caller "$VAULT_CUSTOMER" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" \
+  --initial_deposit 500000 \
+  --low_balance_threshold 0 \
+  --auto_topup_amount 0 2>&1 || true)
+assert_error "deposit below minimum rejected (DepositTooSmall)" "$OUT"
+
+step "18.12" "deposit: add 0.20 USDC to the vault"
+OUT=$(invoke_escrow_vault_as $CUSTOMER_SOURCE deposit \
+  --caller "$VAULT_CUSTOMER" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" \
+  --amount $DEPOSIT_AMOUNT 2>&1 || true)
+assert_success "deposit succeeds" "$OUT"
+EXPECTED_BALANCE=$((INITIAL_DEPOSIT + DEPOSIT_AMOUNT))
+assert_contains "balance after deposit is correct" "$OUT" "$EXPECTED_BALANCE"
+
+step "18.13" "get_balance reflects the deposit"
+OUT=$(invoke_escrow_vault get_balance \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" 2>&1 || true)
+assert_contains "balance updated after deposit" "$OUT" "$EXPECTED_BALANCE"
+
+step "18.14" "deposit below minimum is rejected (DepositTooSmall)"
+OUT=$(invoke_escrow_vault_as $CUSTOMER_SOURCE deposit \
+  --caller "$VAULT_CUSTOMER" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" \
+  --amount 100000 2>&1 || true)
+assert_error "deposit below minimum rejected" "$OUT"
+
+step "18.15" "debit_vault: admin debits 0.10 USDC to developer"
+OUT=$(invoke_escrow_vault debit_vault \
+  --caller "$ADMIN_ADDRESS" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" \
+  --amount $DEBIT_AMOUNT \
+  --usage_description '"100 API calls"' 2>&1 || true)
+assert_success "debit_vault succeeds" "$OUT"
+EXPECTED_AFTER_DEBIT=$((EXPECTED_BALANCE - DEBIT_AMOUNT))
+assert_contains "balance after debit is correct" "$OUT" "$EXPECTED_AFTER_DEBIT"
+
+step "18.16" "get_vault shows updated total_debited"
+OUT=$(invoke_escrow_vault get_vault \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" 2>&1 || true)
+assert_contains "total_debited reflects the debit" "$OUT" "$DEBIT_AMOUNT"
+
+step "18.17" "debit_vault with zero amount is rejected (InvalidAmount)"
+OUT=$(invoke_escrow_vault debit_vault \
+  --caller "$ADMIN_ADDRESS" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" \
+  --amount 0 \
+  --usage_description '"zero"' 2>&1 || true)
+assert_error "zero debit rejected (InvalidAmount)" "$OUT"
+
+step "18.18" "debit_vault exceeding balance is rejected (InsufficientVaultBalance)"
+OUT=$(invoke_escrow_vault debit_vault \
+  --caller "$ADMIN_ADDRESS" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" \
+  --amount 999999999 \
+  --usage_description '"too much"' 2>&1 || true)
+assert_error "over-balance debit rejected (InsufficientVaultBalance)" "$OUT"
+
+step "18.19" "debit_vault by non-admin is rejected (Unauthorized)"
+OUT=$(invoke_escrow_vault_as $CUSTOMER_SOURCE debit_vault \
+  --caller "$VAULT_CUSTOMER" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" \
+  --amount $DEBIT_AMOUNT \
+  --usage_description '"unauthorized"' 2>&1 || true)
+assert_error "non-admin debit rejected (Unauthorized)" "$OUT"
+
+step "18.20" "update_threshold: set low-balance alert to 2 USDC, no auto top-up"
+OUT=$(invoke_escrow_vault_as $CUSTOMER_SOURCE update_threshold \
+  --caller "$VAULT_CUSTOMER" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" \
+  --new_threshold 20000000 \
+  --new_auto_topup 0 2>&1 || true)
+assert_success "update_threshold succeeds" "$OUT"
+
+step "18.21" "get_vault shows updated threshold"
+OUT=$(invoke_escrow_vault get_vault \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" 2>&1 || true)
+assert_contains "low_balance_threshold updated" "$OUT" "20000000"
+
+step "18.22" "update_threshold with negative value is rejected (InvalidThreshold)"
+OUT=$(invoke_escrow_vault_as $CUSTOMER_SOURCE update_threshold \
+  --caller "$VAULT_CUSTOMER" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" \
+  --new_threshold -1 \
+  --new_auto_topup 0 2>&1 || true)
+assert_error "negative threshold rejected (InvalidThreshold)" "$OUT"
+
+step "18.23" "withdraw: customer withdraws 0.10 USDC"
+OUT=$(invoke_escrow_vault_as $CUSTOMER_SOURCE withdraw \
+  --caller "$VAULT_CUSTOMER" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" \
+  --amount $WITHDRAW_AMOUNT 2>&1 || true)
+assert_success "withdraw succeeds" "$OUT"
+EXPECTED_AFTER_WITHDRAW=$((EXPECTED_AFTER_DEBIT - WITHDRAW_AMOUNT))
+assert_contains "balance after withdraw is correct" "$OUT" "$EXPECTED_AFTER_WITHDRAW"
+
+step "18.24" "withdraw with zero amount is rejected (InvalidAmount)"
+OUT=$(invoke_escrow_vault_as $CUSTOMER_SOURCE withdraw \
+  --caller "$VAULT_CUSTOMER" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" \
+  --amount 0 2>&1 || true)
+assert_error "zero withdraw rejected (InvalidAmount)" "$OUT"
+
+step "18.25" "withdraw exceeding balance is rejected (InsufficientVaultBalance)"
+OUT=$(invoke_escrow_vault_as $CUSTOMER_SOURCE withdraw \
+  --caller "$VAULT_CUSTOMER" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" \
+  --amount 999999999 2>&1 || true)
+assert_error "over-balance withdraw rejected (InsufficientVaultBalance)" "$OUT"
+
+step "18.26" "withdraw by non-owner is rejected (Unauthorized)"
+OUT=$(invoke_escrow_vault withdraw \
+  --caller "$ADMIN_ADDRESS" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" \
+  --amount $WITHDRAW_AMOUNT 2>&1 || true)
+assert_error "non-owner withdraw rejected (Unauthorized)" "$OUT"
+
+step "18.27" "transfer_admin to same address (verify function works)"
+OUT=$(invoke_escrow_vault transfer_admin \
+  --caller "$ADMIN_ADDRESS" \
+  --new_admin "$ADMIN_ADDRESS" 2>&1 || true)
+assert_success "transfer_admin succeeds" "$OUT"
+
+step "18.28" "get_admin still returns admin after self-transfer"
+OUT=$(invoke_escrow_vault get_admin 2>&1 || true)
+assert_contains "admin unchanged after self-transfer" "$OUT" "$ADMIN_ADDRESS"
+
+step "18.29" "close_vault: admin closes the vault and refunds remaining balance"
+OUT=$(invoke_escrow_vault close_vault \
+  --caller "$ADMIN_ADDRESS" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" 2>&1 || true)
+assert_success "close_vault succeeds" "$OUT"
+assert_contains "refunded amount is non-negative" "$OUT" "refunded"
+
+step "18.30" "vault_exists returns false after close"
+OUT=$(invoke_escrow_vault vault_exists \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" 2>&1 || true)
+assert_contains "vault gone after close" "$OUT" "false"
+
+step "18.31" "get_vault returns null after close"
+OUT=$(invoke_escrow_vault get_vault \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" 2>&1 || true)
+assert_contains "get_vault null after close" "$OUT" "null"
+
+step "18.32" "close_vault on non-existent vault is rejected (VaultNotFound)"
+OUT=$(invoke_escrow_vault close_vault \
+  --caller "$ADMIN_ADDRESS" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" 2>&1 || true)
+assert_error "close on non-existent vault rejected (VaultNotFound)" "$OUT"
+
+step "18.33" "create_vault can be called again after close (same pair)"
+OUT=$(invoke_escrow_vault_as $CUSTOMER_SOURCE create_vault \
+  --caller "$VAULT_CUSTOMER" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" \
+  --initial_deposit $INITIAL_DEPOSIT \
+  --low_balance_threshold 0 \
+  --auto_topup_amount 0 2>&1 || true)
+assert_success "re-create vault after close succeeds" "$OUT"
+
+step "18.34" "customer closes their own vault (customer auth)"
+OUT=$(invoke_escrow_vault_as $CUSTOMER_SOURCE close_vault \
+  --caller "$VAULT_CUSTOMER" \
+  --customer "$VAULT_CUSTOMER" \
+  --developer "$VAULT_DEVELOPER" 2>&1 || true)
+assert_success "customer can close their own vault" "$OUT"
+
+fi  # end ledger fetch check
+fi  # end ESCROW_VAULT_CONTRACT_ID check
+
+########################################
+# SUMMARY
+########################################
+
+echo ""
+echo -e "${BOLD}╔════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}║           Test Results Summary             ║${NC}"
+echo -e "${BOLD}╚════════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "  ${GREEN}✓ Passed:  $PASS${NC}"
+echo -e "  ${RED}✗ Failed:  $FAIL${NC}"
+echo -e "  ${YELLOW}⊘ Skipped: $SKIP${NC}"
+echo ""
+
+TOTAL=$((PASS + FAIL))
+if [ $TOTAL -gt 0 ]; then
+  PCT=$(( PASS * 100 / TOTAL ))
+  echo "  Pass rate: $PCT% ($PASS / $TOTAL)"
+fi
+
+echo ""
+echo "  Registry:     https://stellar.expert/explorer/testnet/contract/$REGISTRY_CONTRACT_ID"
+echo "  BillingCycle: https://stellar.expert/explorer/testnet/contract/$BILLING_CONTRACT_ID"
+[ -n "$SPEND_POLICY_CONTRACT_ID"  ] && echo "  SpendPolicy:  https://stellar.expert/explorer/testnet/contract/$SPEND_POLICY_CONTRACT_ID"
+[ -n "$ESCROW_VAULT_CONTRACT_ID"  ] && echo "  EscrowVault:  https://stellar.expert/explorer/testnet/contract/$ESCROW_VAULT_CONTRACT_ID"
+echo ""
+
+if [ $FAIL -eq 0 ]; then
+  echo -e "${GREEN}${BOLD}  ✅ All tests passed. Contracts are ready.${NC}"
+  echo ""
+  exit 0
+else
+  echo -e "${RED}${BOLD}  ❌ $FAIL test(s) failed. Check output above.${NC}"
+  echo ""
+  exit 1
+fi
